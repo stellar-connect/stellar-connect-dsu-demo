@@ -1,0 +1,13 @@
+{
+  "name": "stellar-connect-dsu-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "STELLAR CONNECT · 2026 DSU AI 챌린지 B트랙 시연용 웹앱 (가상 데이터)",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node ./server/demo-server.mjs"
+  }
+}
