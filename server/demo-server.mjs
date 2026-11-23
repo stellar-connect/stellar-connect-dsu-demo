@@ -74,8 +74,8 @@ const SYSTEM_PROMPT = [
   "- attention: 주의가 필요한 팀마다 '팀 이름: 이유(근거 수치)' 형식 문장",
   "- questions: 학생들이 반복해서 묻는 주제와 해당 팀 문장",
   "- actions: 교수가 다음 수업 전에 할 구체적 조치 문장 3개",
-  "- reminder: 필독 공지를 아직 확인하지 않은 학생에게 보낼 친근한 2문장 (문자열)",
-  "- nudges: status가 attention인 팀마다 {team: 팀 이름, message: 그 팀 채팅에 보낼 따뜻하고 구체적인 격려 2문장}",
+  "- reminder: 필독 공지를 아직 확인하지 않은 학생에게 보낼 친근한 2문장, 존댓말(해요체) (문자열)",
+  "- nudges: status가 attention인 팀마다 {team: 팀 이름, message: 교수가 그 팀 채팅에 보낼 따뜻하고 구체적인 격려 2문장. '팀 이름 여러분,'으로 시작하고 존댓말(해요체)로 씁니다}",
   "모든 항목은 짧은 한국어 한 문장입니다. 글자 수를 세지 마세요.",
 ].join("\n");
 const TEMPLATE_ECHO = /이번 주 요약 2~3개|이유와 근거 수치|status가 attention인 팀 이름|구체적 조치 3개/;
@@ -210,13 +210,15 @@ async function serveStatic(request, response) {
   try {
     if (!(await stat(target)).isFile()) throw new Error("not a file");
   } catch {
+    // Missing build files must 404 (never fall back to HTML), or a stale page shows a blank screen.
+    if (/\.[a-z0-9]{2,5}$/i.test(requested)) return send(response, 404, "Not found", { "cache-control": "no-store" });
     target = join(DIST, "index.html");
   }
   try {
     const data = await readFile(target);
     const type = TYPES[extname(target).toLowerCase()] ?? "application/octet-stream";
     const immutable = target.includes(`${sep}assets${sep}`);
-    send(response, 200, data, { "content-type": type, "cache-control": immutable ? "public, max-age=31536000, immutable" : "no-cache" });
+    send(response, 200, data, { "content-type": type, "cache-control": immutable ? "public, max-age=31536000, immutable" : "no-store" });
   } catch {
     send(response, 404, "Not found");
   }
