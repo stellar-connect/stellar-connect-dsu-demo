@@ -18,7 +18,7 @@ const HOST = process.env.HOST ?? "0.0.0.0";
 const LLM_BASE_URL = (process.env.AX_LLM_BASE_URL ?? process.env.OPENAI_BASE_URL ?? "").replace(/\/+$/, "");
 const LLM_API_KEY = process.env.AX_LLM_API_KEY ?? process.env.OPENAI_API_KEY ?? "";
 const LLM_MODEL = process.env.AX_LLM_MODEL ?? "ax-local";
-const LLM_TIMEOUT_MS = Number(process.env.AX_LLM_TIMEOUT_MS ?? 40_000);
+const LLM_TIMEOUT_MS = Number(process.env.AX_LLM_TIMEOUT_MS ?? 70_000);
 const MAX_BODY = 64 * 1024;
 
 const TYPES = {
@@ -64,6 +64,7 @@ async function readBody(request) {
 }
 
 const SYSTEM_PROMPT = [
+  "Reasoning: low",
   "당신은 대학 신입생 세미나를 운영하는 교수를 돕는 수업 운영 비서 'Spark AI'입니다.",
   "입력은 한 분반의 팀별 활동 지표(JSON)입니다. 개인 이름은 없으며 모든 데이터는 시연용 가상 데이터입니다.",
   "입력에 없는 사실을 지어내지 말고, 숫자와 팀 이름은 입력값을 그대로 쓰세요.",
@@ -75,7 +76,7 @@ const SYSTEM_PROMPT = [
   "- actions: 교수가 다음 수업 전에 할 구체적 조치 문장 3개",
   "- reminder: 필독 공지를 아직 확인하지 않은 학생에게 보낼 친근한 2문장 (문자열)",
   "- nudges: status가 attention인 팀마다 {team: 팀 이름, message: 그 팀 채팅에 보낼 따뜻하고 구체적인 격려 2문장}",
-  "모든 배열 항목은 한국어 한 문장(80자 이내)입니다.",
+  "모든 항목은 짧은 한국어 한 문장입니다. 글자 수를 세지 마세요.",
 ].join("\n");
 const TEMPLATE_ECHO = /이번 주 요약 2~3개|이유와 근거 수치|status가 attention인 팀 이름|구체적 조치 3개/;
 
@@ -121,7 +122,7 @@ export function parseModelJson(text) {
   return null;
 }
 
-async function requestCompletion(insights, { jsonMode }) {
+async function requestCompletion(insights, { jsonMode, lowReasoning }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
   try {
@@ -131,8 +132,9 @@ async function requestCompletion(insights, { jsonMode }) {
       body: JSON.stringify({
         model: LLM_MODEL,
         temperature: 0.3,
-        max_tokens: 2000,
+        max_tokens: 3500,
         ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+        ...(lowReasoning ? { reasoning_effort: "low" } : {}),
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: `${JSON.stringify(insights)}\n\n/no_think` },
@@ -146,10 +148,10 @@ async function requestCompletion(insights, { jsonMode }) {
 }
 
 async function callLlm(insights) {
-  let response = await requestCompletion(insights, { jsonMode: true });
+  let response = await requestCompletion(insights, { jsonMode: true, lowReasoning: true });
   if (response.status === 400 || response.status === 422) {
-    console.warn(`[spark] json mode rejected (HTTP ${response.status}); retrying without it`);
-    response = await requestCompletion(insights, { jsonMode: false });
+    console.warn(`[spark] optional parameters rejected (HTTP ${response.status}); retrying without them`);
+    response = await requestCompletion(insights, { jsonMode: false, lowReasoning: false });
   }
   if (!response.ok) {
     const detail = (await response.text().catch(() => "")).slice(0, 300).replace(/sk-[A-Za-z0-9_-]+/g, "sk-***");
