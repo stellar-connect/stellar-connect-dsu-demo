@@ -66,10 +66,18 @@ async function readBody(request) {
 const SYSTEM_PROMPT = [
   "당신은 대학 신입생 세미나를 운영하는 교수를 돕는 수업 운영 비서 'Spark AI'입니다.",
   "입력은 한 분반의 팀별 활동 지표(JSON)입니다. 개인 이름은 없으며 모든 데이터는 시연용 가상 데이터입니다.",
-  "입력에 없는 사실을 지어내지 말고, 숫자는 입력값을 그대로 사용하세요.",
-  "반드시 아래 JSON 형식으로만 답하세요. 각 배열 항목은 한국어 한 문장(80자 이내)입니다.",
-  '{"summary":["이번 주 요약 2~3개"],"attention":["주의가 필요한 팀: 이유와 근거 수치"],"questions":["학생들이 반복해서 묻는 주제와 팀"],"actions":["다음 수업 전 교수가 할 구체적 조치 3개"],"reminder":"필독 공지를 확인하지 않은 학생에게 보낼 친근한 2문장 안내","nudges":[{"team":"status가 attention인 팀 이름","message":"교수가 그 팀 채팅에 보낼 따뜻하고 구체적인 격려 2문장"}]}',
+  "입력에 없는 사실을 지어내지 말고, 숫자와 팀 이름은 입력값을 그대로 쓰세요.",
+  "생각 과정은 쓰지 말고, 설명 없이 JSON 객체 하나만 바로 출력하세요.",
+  "JSON 키와 내용:",
+  "- summary: 이번 주 분반 상황 요약 문장 2~3개 (참여율 변화, 가장 낮은 공지 확인률, 설문 결과 포함)",
+  "- attention: 주의가 필요한 팀마다 '팀 이름: 이유(근거 수치)' 형식 문장",
+  "- questions: 학생들이 반복해서 묻는 주제와 해당 팀 문장",
+  "- actions: 교수가 다음 수업 전에 할 구체적 조치 문장 3개",
+  "- reminder: 필독 공지를 아직 확인하지 않은 학생에게 보낼 친근한 2문장 (문자열)",
+  "- nudges: status가 attention인 팀마다 {team: 팀 이름, message: 그 팀 채팅에 보낼 따뜻하고 구체적인 격려 2문장}",
+  "모든 배열 항목은 한국어 한 문장(80자 이내)입니다.",
 ].join("\n");
+const TEMPLATE_ECHO = /이번 주 요약 2~3개|이유와 근거 수치|status가 attention인 팀 이름|구체적 조치 3개/;
 
 // Local models often wrap JSON in reasoning tags, code fences, prose or trailing commas. Be forgiving.
 export function parseModelJson(text) {
@@ -99,60 +107,70 @@ export function parseModelJson(text) {
       }
     }
   }
-  attempts.push(...blocks.sort((left, right) => right.length - left.length));
+  // The final answer comes after any reasoning, so try the last blocks first.
+  attempts.unshift(...blocks.reverse());
   for (const candidate of attempts) {
     for (const variant of [candidate, candidate.replace(/,\s*([}\]])/g, "$1")]) {
       try {
         const parsed = JSON.parse(variant);
         const value = parsed?.briefing && typeof parsed.briefing === "object" ? parsed.briefing : parsed;
-        if (value && typeof value === "object" && (value.summary || value.actions)) return value;
+        if (value && typeof value === "object" && (value.summary || value.actions) && !TEMPLATE_ECHO.test(JSON.stringify(value))) return value;
       } catch { /* try the next candidate */ }
     }
   }
   return null;
 }
 
-async function callLlm(insights) {
+async function requestCompletion(insights, { jsonMode }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
   try {
-    const response = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+    return await fetch(`${LLM_BASE_URL}/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${LLM_API_KEY}` },
       body: JSON.stringify({
         model: LLM_MODEL,
         temperature: 0.3,
-        max_tokens: 2500,
+        max_tokens: 2000,
+        ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: JSON.stringify(insights) },
+          { role: "user", content: `${JSON.stringify(insights)}\n\n/no_think` },
         ],
       }),
       signal: controller.signal,
     });
-    if (!response.ok) {
-      const detail = (await response.text().catch(() => "")).slice(0, 300).replace(/sk-[A-Za-z0-9_-]+/g, "sk-***");
-      throw Object.assign(new Error(`LLM HTTP ${response.status}: ${detail}`), { status: 502, reason: `http-${response.status}` });
-    }
-    const payload = await response.json();
-    const message = payload?.choices?.[0]?.message ?? {};
-    const content = message.content || message.reasoning_content || "";
-    const finish = payload?.choices?.[0]?.finish_reason ?? "unknown";
-    const briefing = parseModelJson(content);
-    if (!briefing) {
-      const text = String(content);
-      console.warn(`[spark] unparsable model output (${text.length} chars, finish=${finish}): ${text.slice(0, 400).replace(/\s+/g, " ")}`);
-      // Model output is about virtual demo data only; a short excerpt helps diagnose format problems.
-      throw Object.assign(new Error("LLM returned no JSON"), {
-        status: 502,
-        reason: `unparsable-output-${text.length}-finish-${finish}`,
-        sample: `${text.slice(0, 500)}\n…\n${text.slice(-300)}`,
-      });
-    }
-    return { briefing, model: payload?.model ?? LLM_MODEL, usage: payload?.usage ?? null };
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function callLlm(insights) {
+  let response = await requestCompletion(insights, { jsonMode: true });
+  if (response.status === 400 || response.status === 422) {
+    console.warn(`[spark] json mode rejected (HTTP ${response.status}); retrying without it`);
+    response = await requestCompletion(insights, { jsonMode: false });
+  }
+  if (!response.ok) {
+    const detail = (await response.text().catch(() => "")).slice(0, 300).replace(/sk-[A-Za-z0-9_-]+/g, "sk-***");
+    throw Object.assign(new Error(`LLM HTTP ${response.status}: ${detail}`), { status: 502, reason: `http-${response.status}` });
+  }
+  const payload = await response.json();
+  const message = payload?.choices?.[0]?.message ?? {};
+  const content = message.content || message.reasoning_content || "";
+  const finish = payload?.choices?.[0]?.finish_reason ?? "unknown";
+  const briefing = parseModelJson(content);
+  if (!briefing) {
+    const text = String(content);
+    console.warn(`[spark] unparsable model output (${text.length} chars, finish=${finish}): ${text.slice(0, 400).replace(/\s+/g, " ")}`);
+    // Model output is about virtual demo data only; a short excerpt helps diagnose format problems.
+    throw Object.assign(new Error("LLM returned no JSON"), {
+      status: 502,
+      reason: `unparsable-output-${text.length}-finish-${finish}`,
+      sample: `${text.slice(0, 500)}\n…\n${text.slice(-300)}`,
+    });
+  }
+  return { briefing, model: payload?.model ?? LLM_MODEL, usage: payload?.usage ?? null, finish, chars: String(content).length };
 }
 
 async function handleBriefing(request, response) {
