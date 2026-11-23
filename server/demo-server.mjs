@@ -104,7 +104,8 @@ export function parseModelJson(text) {
     for (const variant of [candidate, candidate.replace(/,\s*([}\]])/g, "$1")]) {
       try {
         const parsed = JSON.parse(variant);
-        if (parsed && typeof parsed === "object" && (parsed.summary || parsed.actions)) return parsed;
+        const value = parsed?.briefing && typeof parsed.briefing === "object" ? parsed.briefing : parsed;
+        if (value && typeof value === "object" && (value.summary || value.actions)) return value;
       } catch { /* try the next candidate */ }
     }
   }
@@ -121,7 +122,7 @@ async function callLlm(insights) {
       body: JSON.stringify({
         model: LLM_MODEL,
         temperature: 0.3,
-        max_tokens: 1300,
+        max_tokens: 2500,
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: JSON.stringify(insights) },
@@ -136,10 +137,17 @@ async function callLlm(insights) {
     const payload = await response.json();
     const message = payload?.choices?.[0]?.message ?? {};
     const content = message.content || message.reasoning_content || "";
+    const finish = payload?.choices?.[0]?.finish_reason ?? "unknown";
     const briefing = parseModelJson(content);
     if (!briefing) {
-      console.warn(`[spark] unparsable model output (${String(content).length} chars): ${String(content).slice(0, 400).replace(/\s+/g, " ")}`);
-      throw Object.assign(new Error("LLM returned no JSON"), { status: 502, reason: `unparsable-output-${String(content).length}` });
+      const text = String(content);
+      console.warn(`[spark] unparsable model output (${text.length} chars, finish=${finish}): ${text.slice(0, 400).replace(/\s+/g, " ")}`);
+      // Model output is about virtual demo data only; a short excerpt helps diagnose format problems.
+      throw Object.assign(new Error("LLM returned no JSON"), {
+        status: 502,
+        reason: `unparsable-output-${text.length}-finish-${finish}`,
+        sample: `${text.slice(0, 500)}\n…\n${text.slice(-300)}`,
+      });
     }
     return { briefing, model: payload?.model ?? LLM_MODEL, usage: payload?.usage ?? null };
   } finally {
@@ -170,7 +178,7 @@ async function handleBriefing(request, response) {
   } catch (error) {
     console.warn(`[spark] briefing failed: ${error.message}`);
     const reason = error.reason ?? (error.name === "AbortError" ? "timeout" : "network");
-    return sendJson(response, error.status ?? 502, { error: "llm-failed", reason });
+    return sendJson(response, error.status ?? 502, { error: "llm-failed", reason, ...(error.sample ? { sample: error.sample } : {}) });
   }
 }
 
