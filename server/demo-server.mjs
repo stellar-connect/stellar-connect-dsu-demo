@@ -18,7 +18,7 @@ const HOST = process.env.HOST ?? "0.0.0.0";
 const LLM_BASE_URL = (process.env.AX_LLM_BASE_URL ?? process.env.OPENAI_BASE_URL ?? "").replace(/\/+$/, "");
 const LLM_API_KEY = process.env.AX_LLM_API_KEY ?? process.env.OPENAI_API_KEY ?? "";
 const LLM_MODEL = process.env.AX_LLM_MODEL ?? "ax-local";
-const LLM_TIMEOUT_MS = Number(process.env.AX_LLM_TIMEOUT_MS ?? 22_000);
+const LLM_TIMEOUT_MS = Number(process.env.AX_LLM_TIMEOUT_MS ?? 40_000);
 const MAX_BODY = 64 * 1024;
 
 const TYPES = {
@@ -71,12 +71,44 @@ const SYSTEM_PROMPT = [
   '{"summary":["이번 주 요약 2~3개"],"attention":["주의가 필요한 팀: 이유와 근거 수치"],"questions":["학생들이 반복해서 묻는 주제와 팀"],"actions":["다음 수업 전 교수가 할 구체적 조치 3개"],"reminder":"필독 공지를 확인하지 않은 학생에게 보낼 친근한 2문장 안내","nudges":[{"team":"status가 attention인 팀 이름","message":"교수가 그 팀 채팅에 보낼 따뜻하고 구체적인 격려 2문장"}]}',
 ].join("\n");
 
-function parseModelJson(text) {
-  const cleaned = String(text ?? "").replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+// Local models often wrap JSON in reasoning tags, code fences, prose or trailing commas. Be forgiving.
+export function parseModelJson(text) {
+  const cleaned = String(text ?? "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/^[\s\S]*<\/think>/i, "")
+    .replace(/```(?:json)?/gi, "")
+    .replace(/[“”]/g, '"')
+    .trim();
+  const attempts = [];
   const start = cleaned.indexOf("{");
   const end = cleaned.lastIndexOf("}");
-  if (start < 0 || end <= start) return null;
-  try { return JSON.parse(cleaned.slice(start, end + 1)); } catch { return null; }
+  if (start >= 0 && end > start) attempts.push(cleaned.slice(start, end + 1));
+  const blocks = [];
+  for (let index = 0; index < cleaned.length; index += 1) {
+    if (cleaned[index] !== "{") continue;
+    let depth = 0;
+    let inString = false;
+    for (let cursor = index; cursor < cleaned.length; cursor += 1) {
+      const character = cleaned[cursor];
+      if (character === '"' && cleaned[cursor - 1] !== "\\") inString = !inString;
+      if (inString) continue;
+      if (character === "{") depth += 1;
+      if (character === "}" && --depth === 0) {
+        blocks.push(cleaned.slice(index, cursor + 1));
+        break;
+      }
+    }
+  }
+  attempts.push(...blocks.sort((left, right) => right.length - left.length));
+  for (const candidate of attempts) {
+    for (const variant of [candidate, candidate.replace(/,\s*([}\]])/g, "$1")]) {
+      try {
+        const parsed = JSON.parse(variant);
+        if (parsed && typeof parsed === "object" && (parsed.summary || parsed.actions)) return parsed;
+      } catch { /* try the next candidate */ }
+    }
+  }
+  return null;
 }
 
 async function callLlm(insights) {
@@ -97,10 +129,18 @@ async function callLlm(insights) {
       }),
       signal: controller.signal,
     });
-    if (!response.ok) throw Object.assign(new Error(`LLM HTTP ${response.status}`), { status: 502 });
+    if (!response.ok) {
+      const detail = (await response.text().catch(() => "")).slice(0, 300).replace(/sk-[A-Za-z0-9_-]+/g, "sk-***");
+      throw Object.assign(new Error(`LLM HTTP ${response.status}: ${detail}`), { status: 502, reason: `http-${response.status}` });
+    }
     const payload = await response.json();
-    const briefing = parseModelJson(payload?.choices?.[0]?.message?.content);
-    if (!briefing) throw Object.assign(new Error("LLM returned no JSON"), { status: 502 });
+    const message = payload?.choices?.[0]?.message ?? {};
+    const content = message.content || message.reasoning_content || "";
+    const briefing = parseModelJson(content);
+    if (!briefing) {
+      console.warn(`[spark] unparsable model output (${String(content).length} chars): ${String(content).slice(0, 400).replace(/\s+/g, " ")}`);
+      throw Object.assign(new Error("LLM returned no JSON"), { status: 502, reason: `unparsable-output-${String(content).length}` });
+    }
     return { briefing, model: payload?.model ?? LLM_MODEL, usage: payload?.usage ?? null };
   } finally {
     clearTimeout(timer);
@@ -129,7 +169,8 @@ async function handleBriefing(request, response) {
     return sendJson(response, 200, value);
   } catch (error) {
     console.warn(`[spark] briefing failed: ${error.message}`);
-    return sendJson(response, error.status ?? 502, { error: "llm-failed" });
+    const reason = error.reason ?? (error.name === "AbortError" ? "timeout" : "network");
+    return sendJson(response, error.status ?? 502, { error: "llm-failed", reason });
   }
 }
 
