@@ -175,9 +175,17 @@ async function callLlm(insights) {
   return { briefing, model: payload?.model ?? LLM_MODEL, usage: payload?.usage ?? null, finish, chars: String(content).length };
 }
 
+const CACHE_TTL_MS = 60 * 60_000;
+const MAX_CONCURRENT_LLM = 4;
+const inflight = new Map();
+
+function clientKey(request) {
+  // Behind the AX proxy every visitor shares the socket address; use the forwarded client address.
+  const forwarded = String(request.headers["x-forwarded-for"] ?? "").split(",")[0].trim();
+  return forwarded || request.headers["x-real-ip"] || request.socket.remoteAddress || "unknown";
+}
+
 async function handleBriefing(request, response) {
-  const ip = request.socket.remoteAddress ?? "unknown";
-  if (rateLimited(ip)) return sendJson(response, 429, { error: "rate-limited" });
   if (!LLM_BASE_URL || !LLM_API_KEY) return sendJson(response, 503, { error: "llm-not-configured" });
   let body;
   try {
@@ -187,10 +195,18 @@ async function handleBriefing(request, response) {
   }
   if (body?.kind !== "class-briefing" || typeof body.insights !== "object") return sendJson(response, 400, { error: "invalid-kind" });
   const key = createHash("sha256").update(JSON.stringify(body.insights)).digest("hex");
+  // Cached and in-flight answers cost nothing, so they are served before any rate limit.
   const cached = cache.get(key);
-  if (cached && Date.now() - cached.at < 10 * 60_000) return sendJson(response, 200, { ...cached.value, cached: true });
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return sendJson(response, 200, { ...cached.value, cached: true });
+  let job = inflight.get(key);
+  if (!job) {
+    if (rateLimited(clientKey(request))) return sendJson(response, 429, { error: "rate-limited" });
+    if (inflight.size >= MAX_CONCURRENT_LLM) return sendJson(response, 503, { error: "llm-busy", reason: "busy" });
+    job = callLlm(body.insights).finally(() => inflight.delete(key));
+    inflight.set(key, job);
+  }
   try {
-    const value = await callLlm(body.insights);
+    const value = await job;
     cache.set(key, { at: Date.now(), value });
     if (cache.size > 200) cache.delete(cache.keys().next().value);
     console.log(`[spark] briefing ok model=${value.model} tokens=${value.usage?.total_tokens ?? "?"}`);
