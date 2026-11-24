@@ -242,6 +242,9 @@ async function serveStatic(request, response) {
 
 const server = createServer((request, response) => {
   const path = new URL(request.url, "http://localhost").pathname;
+  if (path === "/favicon.ico") {
+    return send(response, 200, '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#65243a"/><path d="M32 12l5.9 13.1 14.3 1.4-10.8 9.6 3.1 14L32 42.8 19.5 50.1l3.1-14-10.8-9.6 14.3-1.4z" fill="#f5efe7"/></svg>', { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" });
+  }
   if (path === "/api/health") return sendJson(response, 200, { ok: true, llm: Boolean(LLM_BASE_URL && LLM_API_KEY), model: LLM_MODEL });
   if (path === "/api/spark/briefing") {
     if (request.method !== "POST") return sendJson(response, 405, { error: "method-not-allowed" });
