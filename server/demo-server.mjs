@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createPushHub, createVapidKeys, MANIFEST, SERVICE_WORKER } from "./web-push.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const DIST = resolve(root, process.env.DEMO_DIST ?? "dist-demo");
@@ -20,6 +21,11 @@ const LLM_API_KEY = process.env.AX_LLM_API_KEY ?? process.env.OPENAI_API_KEY ?? 
 const LLM_MODEL = process.env.AX_LLM_MODEL ?? "ax-local";
 const LLM_TIMEOUT_MS = Number(process.env.AX_LLM_TIMEOUT_MS ?? 70_000);
 const MAX_BODY = 64 * 1024;
+const pushHub = createPushHub({
+  vapid: createVapidKeys({ publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY }),
+  subject: process.env.PUSH_SUBJECT ?? "https://stellar-connect.ax.dongseo.ac.kr",
+});
+const pushRate = new Map();
 
 const TYPES = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -237,6 +243,54 @@ async function handleBriefing(request, response) {
   }
 }
 
+function pushLimited(key, max) {
+  const now = Date.now();
+  const recent = (pushRate.get(key) ?? []).filter(at => now - at < 60_000);
+  recent.push(now);
+  pushRate.set(key, recent);
+  if (pushRate.size > 5000) pushRate.delete(pushRate.keys().next().value);
+  return recent.length > max;
+}
+
+const clip = (value, size) => String(value ?? "").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "").trim().slice(0, size);
+
+async function handlePush(request, response, action) {
+  if (action === "key") return sendJson(response, 200, { publicKey: pushHub.publicKey });
+  if (request.method !== "POST") return sendJson(response, 405, { error: "method-not-allowed" });
+  let body;
+  try {
+    body = JSON.parse(await readBody(request));
+  } catch (error) {
+    return sendJson(response, error.status ?? 400, { error: "invalid-body" });
+  }
+  const room = String(body?.room ?? "");
+  if (!pushHub.validRoom(room)) return sendJson(response, 400, { error: "invalid-room" });
+  if (pushLimited(`ip:${clientKey(request)}`, 40)) return sendJson(response, 429, { error: "rate-limited" });
+  if (action === "subscribe") {
+    const result = pushHub.subscribe(room, body?.subscription);
+    return sendJson(response, result.ok ? 200 : 400, result);
+  }
+  if (action === "unsubscribe") return sendJson(response, 200, pushHub.unsubscribe(room, String(body?.endpoint ?? "")));
+  if (action === "status") return sendJson(response, 200, { devices: pushHub.devices(room) });
+  if (action === "send") {
+    if (pushLimited(`room:${room}`, 12)) return sendJson(response, 429, { error: "rate-limited" });
+    const kind = ["notice", "reminder", "material"].includes(body?.kind) ? body.kind : "notice";
+    const message = {
+      id: clip(body?.id, 80) || `push-${Date.now().toString(36)}`,
+      kind,
+      title: clip(body?.title, 120) || "STELLAR CONNECT",
+      body: clip(body?.body, 1500),
+      required: body?.required === true,
+      url: "/",
+      at: Date.now(),
+    };
+    const result = await pushHub.send(room, message);
+    console.log(`[push] ${kind} room=${room.slice(0, 2)}… sent=${result.sent} failed=${result.failed}`);
+    return sendJson(response, 200, result);
+  }
+  return sendJson(response, 404, { error: "not-found" });
+}
+
 async function serveStatic(request, response) {
   const url = new URL(request.url, "http://localhost");
   const requested = normalize(decodeURIComponent(url.pathname)).replace(/^([/\\])+/, "");
@@ -264,7 +318,11 @@ const server = createServer((request, response) => {
   if (path === "/favicon.ico") {
     return send(response, 200, '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#65243a"/><path d="M32 12l5.9 13.1 14.3 1.4-10.8 9.6 3.1 14L32 42.8 19.5 50.1l3.1-14-10.8-9.6 14.3-1.4z" fill="#f5efe7"/></svg>', { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" });
   }
-  if (path === "/api/health") return sendJson(response, 200, { ok: true, llm: Boolean(LLM_BASE_URL && LLM_API_KEY), model: LLM_MODEL });
+  if (path === "/sw.js") return send(response, 200, SERVICE_WORKER, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store", "service-worker-allowed": "/" });
+  if (path === "/manifest.webmanifest") return send(response, 200, MANIFEST, { "content-type": "application/manifest+json", "cache-control": "no-store" });
+  const pushRoute = /^\/api\/push\/(key|subscribe|unsubscribe|status|send)$/.exec(path);
+  if (pushRoute) return void handlePush(request, response, pushRoute[1]);
+  if (path === "/api/health") return sendJson(response, 200, { ok: true, llm: Boolean(LLM_BASE_URL && LLM_API_KEY), model: LLM_MODEL, push: true });
   if (path === "/api/spark/briefing" || path === "/api/spark/notice") {
     if (request.method !== "POST") return sendJson(response, 405, { error: "method-not-allowed" });
     return void handleBriefing(request, response);
