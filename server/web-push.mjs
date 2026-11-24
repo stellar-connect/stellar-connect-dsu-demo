@@ -66,9 +66,17 @@ const ROOM_PATTERN = /^[A-Z2-9]{6,10}$/;
 const MAX_ROOMS = 2000;
 const MAX_SUBS_PER_ROOM = 30;
 const ROOM_TTL_MS = 14 * 24 * 3600_000;
+const MAX_STRIKES = 3;
 
 export function createPushHub({ vapid = createVapidKeys(), subject = "https://stellar-connect.ax.dongseo.ac.kr", fetchImpl = globalThis.fetch } = {}) {
   const rooms = new Map();
+  // Failed deliveries per endpoint; a device that keeps failing is dropped so counts stay honest.
+  const strikes = new Map();
+  const strike = (entry, endpoint, fatal) => {
+    const count = (strikes.get(endpoint) ?? 0) + 1;
+    if (fatal || count >= MAX_STRIKES) { entry.subs.delete(endpoint); strikes.delete(endpoint); return; }
+    strikes.set(endpoint, count);
+  };
   const prune = () => {
     const now = Date.now();
     for (const [room, entry] of rooms) if (now - entry.touched > ROOM_TTL_MS) rooms.delete(room);
@@ -89,6 +97,7 @@ export function createPushHub({ vapid = createVapidKeys(), subject = "https://st
       }
       entry.touched = Date.now();
       entry.subs.delete(subscription.endpoint);
+      strikes.delete(subscription.endpoint);
       entry.subs.set(subscription.endpoint, { endpoint: subscription.endpoint, keys: { p256dh: subscription.keys.p256dh, auth: subscription.keys.auth } });
       while (entry.subs.size > MAX_SUBS_PER_ROOM) entry.subs.delete(entry.subs.keys().next().value);
       return { ok: true, devices: entry.subs.size };
@@ -119,11 +128,15 @@ export function createPushHub({ vapid = createVapidKeys(), subject = "https://st
             body: encryptPayload(subscription.keys, payload),
             signal: AbortSignal.timeout(10_000),
           });
-          if (response.status === 404 || response.status === 410) entry.subs.delete(subscription.endpoint);
-          if (response.ok) sent += 1; else { failed += 1; console.warn(`[push] ${new URL(subscription.endpoint).hostname} -> ${response.status}`); }
+          if (response.ok) { sent += 1; strikes.delete(subscription.endpoint); return; }
+          failed += 1;
+          console.warn(`[push] ${new URL(subscription.endpoint).hostname} -> ${response.status}`);
+          // Gone or forbidden (e.g. old VAPID key) never recovers; other errors get a second chance.
+          strike(entry, subscription.endpoint, [403, 404, 410].includes(response.status));
         } catch (error) {
           failed += 1;
           console.warn(`[push] send failed: ${error.message}`);
+          strike(entry, subscription.endpoint, false);
         }
       }));
       return { sent, failed, devices: entry.subs.size };
