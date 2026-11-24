@@ -282,6 +282,7 @@ async function handlePush(request, response, action) {
       body: clip(body?.body, 1500),
       required: body?.required === true,
       courseId: clip(body?.courseId, 40) || null,
+      scope: /^(all|d\d{3}(t\d{1,2})?)$/.test(String(body?.scope ?? "")) ? body.scope : "all",
       url: "/",
       at: Date.now(),
     };
