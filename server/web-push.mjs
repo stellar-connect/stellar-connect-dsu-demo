@@ -153,7 +153,7 @@ self.addEventListener("push", event => {
       body: message.body || "",
       tag: message.id || undefined,
       renotify: true,
-      requireInteraction: message.kind === "notice" || message.kind === "reminder",
+      requireInteraction: message.required === true || message.kind === "notice" || message.kind === "reminder",
       icon: "/favicon.ico",
       badge: "/favicon.ico",
       data: { url: message.url || "/" },

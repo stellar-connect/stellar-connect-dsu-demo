@@ -274,13 +274,14 @@ async function handlePush(request, response, action) {
   if (action === "status") return sendJson(response, 200, { devices: pushHub.devices(room) });
   if (action === "send") {
     if (pushLimited(`room:${room}`, 12)) return sendJson(response, 429, { error: "rate-limited" });
-    const kind = ["notice", "reminder", "material"].includes(body?.kind) ? body.kind : "notice";
+    const kind = ["notice", "reminder", "material", "course"].includes(body?.kind) ? body.kind : "notice";
     const message = {
       id: clip(body?.id, 80) || `push-${Date.now().toString(36)}`,
       kind,
       title: clip(body?.title, 120) || "STELLAR CONNECT",
       body: clip(body?.body, 1500),
       required: body?.required === true,
+      courseId: clip(body?.courseId, 40) || null,
       url: "/",
       at: Date.now(),
     };
