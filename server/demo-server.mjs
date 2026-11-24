@@ -78,10 +78,21 @@ const SYSTEM_PROMPT = [
   "- nudges: status가 attention인 팀마다 {team: 팀 이름, message: 교수가 그 팀 채팅에 보낼 따뜻하고 구체적인 격려 2문장. '팀 이름 여러분,'으로 시작하고 존댓말(해요체)로 씁니다}",
   "모든 항목은 짧은 한국어 한 문장입니다. 글자 수를 세지 마세요.",
 ].join("\n");
+const NOTICE_PROMPT = [
+  "Reasoning: low",
+  "당신은 대학 신입생 세미나 교수의 공지 작성을 돕는 'Spark AI'입니다.",
+  "입력은 교수가 쓴 공지 초안(JSON: title, body)입니다. 모든 내용은 시연용 가상 데이터입니다.",
+  "초안의 사실(날짜, 시간, 장소, 숫자, 제출물)은 절대 바꾸거나 새로 만들지 마세요.",
+  "신입생이 한 번에 이해하도록 다듬으세요: 핵심을 먼저, 존댓말(해요체), 짧은 문장, 필요하면 '- '로 시작하는 줄 목록.",
+  "생각 과정은 쓰지 말고 JSON 객체 하나만 출력하세요.",
+  "JSON 키: title(40자 이내의 분명한 제목, 문자열), body(다듬은 본문, 줄바꿈은 \\n, 문자열), summary(학생에게 보여 줄 한 줄 요약, 문자열)",
+].join("\n");
+const isNotice = value => typeof value.title === "string" && typeof value.body === "string" && value.body.trim().length > 0;
 const TEMPLATE_ECHO = /이번 주 요약 2~3개|이유와 근거 수치|status가 attention인 팀 이름|구체적 조치 3개/;
 
 // Local models often wrap JSON in reasoning tags, code fences, prose or trailing commas. Be forgiving.
-export function parseModelJson(text) {
+const isBriefing = value => Boolean(value.summary || value.actions);
+export function parseModelJson(text, isValid = isBriefing) {
   const cleaned = String(text ?? "")
     .replace(/<think>[\s\S]*?<\/think>/gi, "")
     .replace(/^[\s\S]*<\/think>/i, "")
@@ -115,14 +126,14 @@ export function parseModelJson(text) {
       try {
         const parsed = JSON.parse(variant);
         const value = parsed?.briefing && typeof parsed.briefing === "object" ? parsed.briefing : parsed;
-        if (value && typeof value === "object" && (value.summary || value.actions) && !TEMPLATE_ECHO.test(JSON.stringify(value))) return value;
+        if (value && typeof value === "object" && isValid(value) && !TEMPLATE_ECHO.test(JSON.stringify(value))) return value;
       } catch { /* try the next candidate */ }
     }
   }
   return null;
 }
 
-async function requestCompletion(insights, { jsonMode, lowReasoning }) {
+async function requestCompletion(insights, { jsonMode, lowReasoning, systemPrompt = SYSTEM_PROMPT }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
   try {
@@ -136,7 +147,7 @@ async function requestCompletion(insights, { jsonMode, lowReasoning }) {
         ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
         ...(lowReasoning ? { reasoning_effort: "low" } : {}),
         messages: [
-          { role: "system", content: SYSTEM_PROMPT },
+          { role: "system", content: systemPrompt },
           { role: "user", content: `${JSON.stringify(insights)}\n\n/no_think` },
         ],
       }),
@@ -147,11 +158,11 @@ async function requestCompletion(insights, { jsonMode, lowReasoning }) {
   }
 }
 
-async function callLlm(insights) {
-  let response = await requestCompletion(insights, { jsonMode: true, lowReasoning: true });
+async function callLlm(insights, { systemPrompt = SYSTEM_PROMPT, isValid = isBriefing, field = "briefing" } = {}) {
+  let response = await requestCompletion(insights, { jsonMode: true, lowReasoning: true, systemPrompt });
   if (response.status === 400 || response.status === 422) {
     console.warn(`[spark] optional parameters rejected (HTTP ${response.status}); retrying without them`);
-    response = await requestCompletion(insights, { jsonMode: false, lowReasoning: false });
+    response = await requestCompletion(insights, { jsonMode: false, lowReasoning: false, systemPrompt });
   }
   if (!response.ok) {
     const detail = (await response.text().catch(() => "")).slice(0, 300).replace(/sk-[A-Za-z0-9_-]+/g, "sk-***");
@@ -161,8 +172,8 @@ async function callLlm(insights) {
   const message = payload?.choices?.[0]?.message ?? {};
   const content = message.content || message.reasoning_content || "";
   const finish = payload?.choices?.[0]?.finish_reason ?? "unknown";
-  const briefing = parseModelJson(content);
-  if (!briefing) {
+  const parsed = parseModelJson(content, isValid);
+  if (!parsed) {
     const text = String(content);
     console.warn(`[spark] unparsable model output (${text.length} chars, finish=${finish}): ${text.slice(0, 400).replace(/\s+/g, " ")}`);
     // Model output is about virtual demo data only; a short excerpt helps diagnose format problems.
@@ -172,7 +183,7 @@ async function callLlm(insights) {
       sample: `${text.slice(0, 500)}\n…\n${text.slice(-300)}`,
     });
   }
-  return { briefing, model: payload?.model ?? LLM_MODEL, usage: payload?.usage ?? null, finish, chars: String(content).length };
+  return { [field]: parsed, model: payload?.model ?? LLM_MODEL, usage: payload?.usage ?? null, finish, chars: String(content).length };
 }
 
 const CACHE_TTL_MS = 60 * 60_000;
@@ -193,8 +204,16 @@ async function handleBriefing(request, response) {
   } catch (error) {
     return sendJson(response, error.status ?? 400, { error: "invalid-body" });
   }
-  if (body?.kind !== "class-briefing" || typeof body.insights !== "object") return sendJson(response, 400, { error: "invalid-kind" });
-  const key = createHash("sha256").update(JSON.stringify(body.insights)).digest("hex");
+  const kinds = {
+    "class-briefing": { input: body?.insights, options: {} },
+    "notice-polish": { input: body?.draft, options: { systemPrompt: NOTICE_PROMPT, isValid: isNotice, field: "notice" } },
+  };
+  const spec = kinds[body?.kind];
+  if (!spec || typeof spec.input !== "object" || spec.input === null) return sendJson(response, 400, { error: "invalid-kind" });
+  if (body.kind === "notice-polish" && (String(spec.input.body ?? "").length > 4000 || String(spec.input.title ?? "").length > 200)) {
+    return sendJson(response, 413, { error: "draft-too-long" });
+  }
+  const key = createHash("sha256").update(body.kind + JSON.stringify(spec.input)).digest("hex");
   // Cached and in-flight answers cost nothing, so they are served before any rate limit.
   const cached = cache.get(key);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return sendJson(response, 200, { ...cached.value, cached: true });
@@ -202,17 +221,17 @@ async function handleBriefing(request, response) {
   if (!job) {
     if (rateLimited(clientKey(request))) return sendJson(response, 429, { error: "rate-limited" });
     if (inflight.size >= MAX_CONCURRENT_LLM) return sendJson(response, 503, { error: "llm-busy", reason: "busy" });
-    job = callLlm(body.insights).finally(() => inflight.delete(key));
+    job = callLlm(spec.input, spec.options).finally(() => inflight.delete(key));
     inflight.set(key, job);
   }
   try {
     const value = await job;
     cache.set(key, { at: Date.now(), value });
     if (cache.size > 200) cache.delete(cache.keys().next().value);
-    console.log(`[spark] briefing ok model=${value.model} tokens=${value.usage?.total_tokens ?? "?"}`);
+    console.log(`[spark] ${body.kind} ok model=${value.model} tokens=${value.usage?.total_tokens ?? "?"}`);
     return sendJson(response, 200, value);
   } catch (error) {
-    console.warn(`[spark] briefing failed: ${error.message}`);
+    console.warn(`[spark] ${body.kind} failed: ${error.message}`);
     const reason = error.reason ?? (error.name === "AbortError" ? "timeout" : "network");
     return sendJson(response, error.status ?? 502, { error: "llm-failed", reason, ...(error.sample ? { sample: error.sample } : {}) });
   }
@@ -246,7 +265,7 @@ const server = createServer((request, response) => {
     return send(response, 200, '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#65243a"/><path d="M32 12l5.9 13.1 14.3 1.4-10.8 9.6 3.1 14L32 42.8 19.5 50.1l3.1-14-10.8-9.6 14.3-1.4z" fill="#f5efe7"/></svg>', { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" });
   }
   if (path === "/api/health") return sendJson(response, 200, { ok: true, llm: Boolean(LLM_BASE_URL && LLM_API_KEY), model: LLM_MODEL });
-  if (path === "/api/spark/briefing") {
+  if (path === "/api/spark/briefing" || path === "/api/spark/notice") {
     if (request.method !== "POST") return sendJson(response, 405, { error: "method-not-allowed" });
     return void handleBriefing(request, response);
   }
