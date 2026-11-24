@@ -147,8 +147,10 @@ self.addEventListener("push", event => {
   let message = {};
   try { message = event.data ? event.data.json() : {}; } catch { message = { title: "STELLAR CONNECT", body: event.data ? event.data.text() : "" }; }
   const title = message.title || "STELLAR CONNECT";
+  // Save first, then tell open pages, so they find the message when they import it.
   event.waitUntil(Promise.all([
-    remember(message),
+    remember(message).catch(() => {}).then(() => self.clients.matchAll({ type: "window" }))
+      .then(clients => clients.forEach(client => client.postMessage({ type: "stellar-push", message }))),
     self.registration.showNotification(title, {
       body: message.body || "",
       tag: message.id || undefined,
@@ -158,7 +160,6 @@ self.addEventListener("push", event => {
       badge: "/favicon.ico",
       data: { url: message.url || "/" },
     }),
-    self.clients.matchAll({ type: "window" }).then(clients => clients.forEach(client => client.postMessage({ type: "stellar-push", message }))),
   ]));
 });
 self.addEventListener("notificationclick", event => {
