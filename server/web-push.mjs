@@ -107,14 +107,15 @@ export function createPushHub({ vapid = createVapidKeys(), subject = "https://st
       return { ok: true };
     },
     devices: room => rooms.get(room)?.subs.size ?? 0,
-    async send(room, message) {
+    // except: the sending device's endpoint, so a team-chat sender is not notified of their own message.
+    async send(room, message, { except = null } = {}) {
       const entry = rooms.get(room);
       if (!entry || !entry.subs.size) return { sent: 0, failed: 0, devices: 0 };
       entry.touched = Date.now();
       const payload = JSON.stringify(message);
       let sent = 0;
       let failed = 0;
-      await Promise.all([...entry.subs.values()].map(async subscription => {
+      await Promise.all([...entry.subs.values()].filter(subscription => subscription.endpoint !== except).map(async subscription => {
         try {
           const response = await fetchImpl(subscription.endpoint, {
             method: "POST",
@@ -169,6 +170,7 @@ self.addEventListener("push", event => {
       tag: message.id || undefined,
       renotify: true,
       requireInteraction: message.required === true || message.kind === "notice" || message.kind === "reminder",
+      silent: false,
       icon: "/favicon.ico",
       badge: "/favicon.ico",
       data: { url: message.url || "/" },

@@ -274,7 +274,11 @@ async function handlePush(request, response, action) {
   if (action === "status") return sendJson(response, 200, { devices: pushHub.devices(room) });
   if (action === "send") {
     if (pushLimited(`room:${room}`, 12)) return sendJson(response, 429, { error: "rate-limited" });
-    const kind = ["notice", "reminder", "material", "course"].includes(body?.kind) ? body.kind : "notice";
+    const kind = ["notice", "reminder", "material", "course", "team"].includes(body?.kind) ? body.kind : "notice";
+    // Team chat: who wrote what in which team, so the other phones can show it in their own team chat.
+    const team = kind === "team" && /^d{3}-d{1,2}$/.test(String(body?.team?.teamKey ?? ""))
+      ? { teamKey: body.team.teamKey, senderUid: clip(body.team.senderUid, 80), senderName: clip(body.team.senderName, 40), senderRole: ["student", "professor", "assistant"].includes(body.team.senderRole) ? body.team.senderRole : "student", text: clip(body.team.text, 1000) }
+      : null;
     const message = {
       id: clip(body?.id, 80) || `push-${Date.now().toString(36)}`,
       kind,
@@ -283,10 +287,11 @@ async function handlePush(request, response, action) {
       required: body?.required === true,
       courseId: clip(body?.courseId, 40) || null,
       scope: /^(all|d\d{3}(t\d{1,2})?)$/.test(String(body?.scope ?? "")) ? body.scope : "all",
-      url: "/",
+      url: team ? "/#team-chat" : "/",
       at: Date.now(),
+      ...(team ? { team } : {}),
     };
-    const result = await pushHub.send(room, message);
+    const result = await pushHub.send(room, message, { except: typeof body?.except === "string" ? body.except : null });
     console.log(`[push] ${kind} room=${room.slice(0, 2)}… sent=${result.sent} failed=${result.failed}`);
     return sendJson(response, 200, result);
   }
