@@ -93,6 +93,16 @@ const NOTICE_PROMPT = [
   "생각 과정은 쓰지 말고 JSON 객체 하나만 출력하세요.",
   "JSON 키: title(40자 이내의 분명한 제목, 문자열), body(다듬은 본문, 줄바꿈은 \\n, 문자열), summary(학생에게 보여 줄 한 줄 요약, 문자열)",
 ].join("\n");
+const CHAT_FIND_PROMPT = [
+  "Reasoning: low",
+  "당신은 대학 수업 앱의 'Stellar AI'입니다. 학생이 자기 팀 채팅에서 필요한 내용을 찾도록 돕습니다.",
+  "입력(JSON): question(학생의 질문), messages(팀 채팅 메시지 목록, 각 항목 n=번호, text=내용). 이름은 없고 모든 내용은 시연용 가상 데이터입니다.",
+  "질문에 답하는 데 필요한 메시지를 찾아 번호로 알려 주세요. 메시지에 없는 사실(날짜, 시간, 장소, 숫자)은 절대 지어내지 마세요.",
+  "찾지 못하면 answer에 '대화에서 찾지 못했어요.'라고 쓰고 matches는 빈 배열로 두세요.",
+  "생각 과정은 쓰지 말고 JSON 객체 하나만 출력하세요.",
+  "JSON 키: answer(메시지 내용에 근거한 존댓말 한두 문장, 문자열), matches(관련 메시지 번호 배열, 중요한 순서, 최대 5개), keywords(찾는 데 쓴 핵심 단어 배열, 최대 4개)",
+].join("\n");
+const isChatFind = value => typeof value.answer === "string" && value.answer.trim().length > 0 && (value.matches === undefined || Array.isArray(value.matches));
 const isNotice = value => typeof value.title === "string" && typeof value.body === "string" && value.body.trim().length > 0;
 const TEMPLATE_ECHO = /이번 주 요약 2~3개|이유와 근거 수치|status가 attention인 팀 이름|구체적 조치 3개/;
 
@@ -213,11 +223,19 @@ async function handleBriefing(request, response) {
   const kinds = {
     "class-briefing": { input: body?.insights, options: {} },
     "notice-polish": { input: body?.draft, options: { systemPrompt: NOTICE_PROMPT, isValid: isNotice, field: "notice" } },
+    "chat-find": { input: body?.find, options: { systemPrompt: CHAT_FIND_PROMPT, isValid: isChatFind, field: "find" } },
   };
   const spec = kinds[body?.kind];
   if (!spec || typeof spec.input !== "object" || spec.input === null) return sendJson(response, 400, { error: "invalid-kind" });
   if (body.kind === "notice-polish" && (String(spec.input.body ?? "").length > 4000 || String(spec.input.title ?? "").length > 200)) {
     return sendJson(response, 413, { error: "draft-too-long" });
+  }
+  if (body.kind === "chat-find") {
+    const messages = Array.isArray(spec.input.messages) ? spec.input.messages : null;
+    if (!messages || messages.length > 150 || String(spec.input.question ?? "").length > 200
+      || messages.some(item => typeof item?.text !== "string" || item.text.length > 300 || !Number.isInteger(item?.n))) {
+      return sendJson(response, 413, { error: "find-too-long" });
+    }
   }
   const key = createHash("sha256").update(body.kind + JSON.stringify(spec.input)).digest("hex");
   // Cached and in-flight answers cost nothing, so they are served before any rate limit.
